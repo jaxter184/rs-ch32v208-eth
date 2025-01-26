@@ -1,0 +1,10 @@
+[build]
+target = "riscv32imc-unknown-none-elf"
+rustflags = ["-Clink-args=-Map=target/output.map"]
+
+
+[target."riscv32imc-unknown-none-elf"]
+runner = "wlink -v flash --enable-sdi-print --watch-serial"
+
+[unstable]
+build-std = ["core"]

@@ -1,0 +1,37 @@
+[package]
+name = "ch32v208-eth"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# ch32-metapac = "*"
+
+ch32-metapac = { path = "../ch32-data/build/ch32-metapac", features = ["rt"] }
+ch32-hal = { path = "../ch32-hal", features = [
+    "ch32v208gbu6",
+    "memory-x",
+    "embassy",
+    "rt",
+], default-features = false }
+embassy-executor = { version = "0.6.0", features = [
+    "integrated-timers",
+    "arch-riscv32",
+    "executor-thread",
+] }
+
+
+embassy-time = { version = "0.3.2" }
+qingke-rt = "*"
+qingke = "*"
+panic-halt = "1.0"
+
+
+[profile.release]
+strip = false # symbols are not flashed to the microcontroller, so don't strip them.
+# codegen-units = 1        # LLVM can perform better optimizations using a single thread
+debug = true
+debug-assertions = false
+incremental = false
+lto = 'fat'
+opt-level = 'z'
+overflow-checks = false
