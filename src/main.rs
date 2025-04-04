@@ -5,9 +5,14 @@
 
 use ch32_hal::{delay::Delay, interrupt, println, rcc::*};
 use ch32_metapac as pac;
-use core::pin::Pin;
 use embassy_executor::Spawner;
 use panic_halt as _;
+use embassy_net_driver_channel as ch;
+use embassy_time::{Ticker, Duration};
+use embassy_futures::select::{select3, Either3};
+use embassy_net::udp::{PacketMetadata, UdpSocket};
+use embassy_net::{Stack, StackResources};
+use core::mem::MaybeUninit;
 
 struct EthDriver {
     eth: pac::eth::Eth,
@@ -168,8 +173,105 @@ impl EthDriver {
     }
 }
 
+const MTU: usize = 1536;
+const CHAN: usize = 8;
+
+struct Runner<'d> {
+    eth: EthDriver,
+    delay: Delay,
+    ch: ch::Runner<'d, MTU>,
+    rx_buf: [u8; MTU],
+}
+
+impl<'d> Runner<'d> {
+    fn new<'a: 'd>(eth: EthDriver, delay: Delay, state: &'a mut ch::State<MTU, CHAN, CHAN>) -> (Runner<'d>, ch::Device<'a, MTU>) {
+        let mut mac = [0u8; 6];
+        println!("Init Eth");
+        eth.init();
+        println!("Init done");
+        eth.get_mac(&mut mac); // get MAC from ROM
+        eth.set_mac(&mac);
+        println!("MAC: {:?}", mac);
+        eth.read_mac(&mut mac);
+        println!("MAC readback: {:?}", mac);
+        println!("Reset PHY");
+        eth.smi_wreg(0, 0x8000); // reset PHY
+        let mut rx_buf = [0_u8; MTU];
+        println!("Start rx: {:?}", eth.start_receive(&mut rx_buf, MTU));
+
+        let (ch, device) = ch::new(state, ch::driver::HardwareAddress::Ethernet(mac));
+
+        (
+            Self {
+                eth,
+                delay,
+                ch,
+                rx_buf,
+            },
+            device,
+        )
+    }
+
+    async fn run(mut self) -> ! {
+        loop {
+            self.delay.delay_ms(1000);
+        let (state_chan, mut rx_chan, mut tx_chan) = self.ch.split();
+        let mut tick = Ticker::every(Duration::from_millis(500));
+        loop {
+            match select3(
+                rx_chan.rx_buf(),
+                tx_chan.tx_buf(),
+                tick.next(),
+            )
+            .await
+            {
+                Either3::First(p) => {
+                    println!("TODO: rx");
+                    /*
+                    if let Ok(n) = self.mac.read_frame(p).await {
+                        rx_chan.rx_done(n);
+                    }
+                    */
+                }
+                Either3::Second(p) => {
+                    println!(
+                        "Start tx: {:?}",
+                        self.eth.start_send(&p, p.len())
+                    );
+                    println!("Eth: {:?}({:x})", self.eth.status(), self.eth.status_raw());
+                    println!("PHY ST: {:x}", self.eth.smi_read_reg(1));
+                    tx_chan.tx_done();
+                }
+                Either3::Third(()) => {
+                    println!("tick");
+                    /*
+                    if self.eth.is_link_up().await {
+                        state_chan.set_link_state(LinkState::Up);
+                    } else {
+                        state_chan.set_link_state(LinkState::Down);
+                    }
+                    */
+                }
+            }
+        }
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn ethernet_task(runner: Runner<'static>) -> ! {
+    println!("Spawning eth");
+    runner.run().await
+}
+
+#[embassy_executor::task]
+async fn net_task(mut runner: embassy_net::Runner<'static, ch::Device<'static, MTU>>) -> ! {
+    println!("Spawning net");
+    runner.run().await
+}
+
 #[embassy_executor::main(entry = "qingke_rt::entry")]
-async fn main(_spawner: Spawner) -> ! {
+async fn main(spawner: Spawner) -> ! {
     let p = ch32_hal::init(ch32_hal::Config {
         // 60 MHz from internal HSI until I get a proper 16MHz crystal
         rcc: ch32_hal::rcc::Config {
@@ -212,47 +314,49 @@ async fn main(_spawner: Spawner) -> ! {
 
     // eth peripheral init
     let eth = EthDriver::new(pac::ETH);
-    let mut mac = [0u8; 6];
-    println!("Init Eth");
-    eth.init();
-    println!("Init done");
-    eth.get_mac(&mut mac); // get MAC from ROM
-    eth.set_mac(&mac);
-    println!("MAC: {:?}", mac);
-    eth.read_mac(&mut mac);
-    println!("MAC readback: {:?}", mac);
-    println!("Reset PHY");
-    eth.smi_wreg(0, 0x8000); // reset PHY
+    static mut STATE: MaybeUninit<ch::State<MTU, CHAN, CHAN>> = MaybeUninit::uninit();
+    let (eth_runner, device) = unsafe {
+        let state = STATE.write(ch::State::new());
+        Runner::new(eth, delay, state)
+    };
 
+    // Init network stack
+    static mut RESOURCES: MaybeUninit<StackResources<2>> = MaybeUninit::uninit();
+    let (stack, runner) = unsafe {
+        let resources = RESOURCES.write(StackResources::<2>::new());
+        embassy_net::new(
+            device,
+            embassy_net::Config::dhcpv4(Default::default()),
+            resources,
+            1234,
+        )
+    };
+
+    println!("Spawning");
+    println!("spawner: {:?}", spawner.spawn(ethernet_task(eth_runner)));
+    println!("spawner: {:?}", spawner.spawn(net_task(runner)));
+
+loop {
     println!("Starting");
+}
 
-    // ARP packet that should be visible with Wireshark on the receiving end
-    let arp: [u8; 6 + 6 + 5 * 2 + 6 + 4 + 6 + 4] = [
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, /* destination MAC address */
-        0x84, 0xc2, 0xe4, 0x01, 0x02, 0x03, /* source MAC address */
-        0x08, 0x06, /* Type:ARP */
-        0x00, 0x01, /* Hardware type:Ethernet(1) */
-        0x08, 0x00, /* Protocol type:IPv4 */
-        0x06, 0x04, /* Hardware size and Protocol size*/
-        0x00, 0x01, /* Opcode:request(1) */
-        0x84, 0xc2, 0xe4, 0x01, 0x02, 0x03, /* Sender MAC address */
-        0xc0, 0xa8, 0x1, 0x0f, /* Sender IP address */
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* Target MAC address */
-        0xc0, 0xa8, 0x1, 0x2, /* Target IP address */
-    ];
-    let mut buf: [u8; 1536] = [0; 1536];
-    println!("Start rx: {:?}", eth.start_receive(&mut buf, 1536));
-    // let pinned_buf = Pin::new(buf.as_ref());
-    // println!("Start rx: {:?}", eth.start_receive(pinned_buf.as_, 1536));
-
+/*
+    let mut rx_buffer = [0; 4096];
+    let mut tx_buffer = [0; 4096];
+    let mut rx_meta = [PacketMetadata::EMPTY; 16];
+    let mut tx_meta = [PacketMetadata::EMPTY; 16];
+    let mut buf = [0; 4096];
     loop {
-        delay.delay_ms(1000);
-        println!(
-            "Start tx: {:?}",
-            eth.start_send(&arp, 6 + 6 + 5 * 2 + 6 + 4 + 6 + 4)
-        );
-        println!("Eth: {:?}({:x})", eth.status(), eth.status_raw());
-        println!("PHY ST: {:x}", eth.smi_read_reg(1));
-        // TODO: RX
+        let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buffer, &mut tx_meta, &mut tx_buffer);
+        socket.bind(1234).unwrap();
+
+        loop {
+            let (n, ep) = socket.recv_from(&mut buf).await.unwrap();
+            if let Ok(s) = core::str::from_utf8(&buf[..n]) {
+                println!("rxd from {}: {}", ep, s);
+            }
+            socket.send_to(&buf[..n], ep).await.unwrap();
+        }
     }
+    */
 }
